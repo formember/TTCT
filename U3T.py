@@ -21,8 +21,12 @@ class U3T(nn.Module):
                  transformer_layers: int,
                  BERT_PATH,
                  device,
+                 threshold=None,
+                 episodic_cost_value=None
                  ):
         super().__init__()
+        self.threshold=threshold
+        self.episodic_cost_value=episodic_cost_value
         self.device=device
         self.embed_dim=embed_dim
         self.obs_dim=obs_dim
@@ -67,8 +71,7 @@ class U3T(nn.Module):
         
     def initialize_parameters(self):
         nn.init.normal_(self.token_embedding.weight, std=0.02)
-        if self.is_act_embedding:
-            nn.init.normal_(self.embedding_act.weight, std=0.02)
+        nn.init.normal_(self.embedding_act.weight, std=0.02)
         nn.init.normal_(self.obs_encoder_linear.weight, std=0.02)
         nn.init.normal_(self.trajectory_positional_embedding, std=0.01)
         nn.init.orthogonal_(self.cost_assignment_layer[0].weight)
@@ -136,10 +139,65 @@ class U3T(nn.Module):
             sum_cost=torch.sum(single_cost)
             cost_assignment_loss += (self.error(sum_cost,episodic_cost[i][0])+self.error(episodic_cost[i][0],sum_cost))/2
         cost_assignment_loss = cost_assignment_loss / hidden_embed.size(0)
-        if self.is_trajectory_inner_loss:
-            cost_assignment_loss += self.trajectory_inner_loss(cos_sim,torch.tensor([item-1 for item in lengths]).to(self.device))
+        cost_assignment_loss += self.trajectory_inner_loss(cos_sim,torch.tensor([item-1 for item in lengths]).to(self.device))
         last_embed = torch.stack([x[i, lengths[i]-1, :] for i in range(x.size(0))]) 
         return last_embed, cost_assignment_loss
+    
+    def test_encode_text(self,text):
+        input_ids = []
+        attention_masks = []
+        for sent in text:
+            encoded_dict=self.tokenizer.encode_plus(sent, add_special_tokens=True, max_length=77, padding='max_length', return_tensors='pt', return_attention_mask=True, return_token_type_ids=False)
+            input_ids.append(encoded_dict['input_ids'])
+            attention_masks.append(encoded_dict['attention_mask'])
+        input_ids = torch.cat(input_ids, dim=0).to(self.device, non_blocking=True)
+        attention_masks = torch.cat(attention_masks, dim=0).to(self.device, non_blocking=True)
+        text_features=self.encode_text(input_ids, attention_masks)
+        return text_features
+    
+    
+    def test_encode_trajectory(self, trajectory,length,lengths):
+        x = trajectory
+        #[batch_size, trajectory_len, vision_dim]
+        x = x + self.trajectory_positional_embedding.type(self.dtype)[0:length,:]
+        x = x.permute(1, 0, 2)  # NLD -> LND
+        x = self.trajectory_transformer(x)
+        x = x.permute(1, 0, 2)  # LND -> NLD
+        x = self.trajectory_ln_final(x).type(self.dtype)
+        x = x @ self.trajectory_projection
+        
+        #[batch, d_model]
+        last_embed = torch.stack([x[i, lengths[i]-1, :] for i in range(x.size(0))]) 
+        
+        return last_embed
+    
+    
+    def test_encode(self,trajectory,actions,lengths,text_features):
+        batchsize=len(trajectory)
+        max_length=max(lengths)
+        padded_obss = []
+        last_obs=[]
+        for obs in trajectory:
+            last_obs.append(obs[-1])
+            padded_obs = np.pad(obs, ((0, max_length - len(obs)), (0, 0), (0, 0), (0, 0)), constant_values=0)
+            padded_obss.append(padded_obs)
+        last_obs=torch.tensor(np.array(last_obs), dtype=torch.float32).to(self.device)
+        last_obs=last_obs.view(batchsize,-1)
+        trajectory = torch.tensor(np.array(padded_obss), dtype=torch.float32).to(self.device)
+        
+        padded_acts = [np.pad(np.array(act, dtype=np.float32), (0, max_length - len(act)), 'constant', constant_values=(-1)) for act in actions]
+        padded_acts = torch.tensor(np.array(padded_acts), dtype=torch.float32).to(self.device, non_blocking=True)
+        actions_view = padded_acts.view(batchsize,max_length,-1)
+        actions_emb=self.embedding_act(actions_view)
+        action_features=actions_emb.view(batchsize,max_length,-1)
+        
+        trajectory=trajectory.view(batchsize,max_length,-1)
+        trajectory_image_features = self.encode_observation(trajectory)
+        trajectory_image_features=self.obs_encoder_linear(trajectory_image_features)
+        trajectory_image_features = torch.cat([trajectory_image_features, action_features], dim=-1)
+            
+        last_embed = self.test_encode_trajectory(trajectory_image_features,max_length,lengths)
+        return torch.cat((last_obs,last_embed,text_features),dim=-1)
     
     
     def encode_text(self, input_ids, attention_mask):
@@ -157,6 +215,56 @@ class U3T(nn.Module):
         x = text_outputs[1]
         text_features = x @ self.text_projection
         return text_features
+    
+    
+    def get_cost_per_trajectory(self,trajectory,text_featrues,length,is_predict_cost):
+        x = trajectory
+        #[batch_size, trajectory_len, vision_dim]
+        x = x + self.trajectory_positional_embedding.type(self.dtype)
+        x = x.permute(1, 0, 2)  # NLD -> LND
+        x = self.trajectory_transformer(x)
+        x = x.permute(1, 0, 2)  # LND -> NLD
+        x = self.trajectory_ln_final(x).type(self.dtype)
+        x = x @ self.trajectory_projection
+        
+        embed=x[0, 0:length, :]
+        embed_norm=embed/embed.norm(dim=-1, keepdim=True)
+        text_featrues_norm = text_featrues / text_featrues.norm(dim=-1, keepdim=True)
+        
+        logit_scale = self.logit_scale.exp()
+        scores = torch.matmul(logit_scale * embed_norm.unsqueeze(1) , text_featrues_norm).squeeze()
+        final_cost = scores > self.threshold
+        if is_predict_cost:
+            atten_score = F.sigmoid(scores)
+            embed_norm = atten_score * embed_norm
+            predict_cost = self.regression(embed_norm,text_featrues_norm).squeeze()
+            final_cost = torch.where(final_cost == 0, predict_cost, self.episodic_cost_value)
+        else:
+            final_cost = torch.where(final_cost == 0, 0, self.episodic_cost_value)
+        return final_cost
+        
+        
+    
+    def get_cost(self,trajectory,actions,text_features,is_predict_cost):
+        length=len(trajectory[0])
+        padded_obss = []
+        for obs in trajectory:
+            padded_obs = np.pad(obs, ((0, self.trajectory_length - len(obs)), (0, 0), (0, 0), (0, 0)), constant_values=0)
+            padded_obss.append(padded_obs)
+        trajectory = torch.tensor(np.array(padded_obss), dtype=torch.float32).to(self.device)
+
+        padded_acts = [np.pad(np.array(act, dtype=np.float32), (0, self.trajectory_length - len(act)), 'constant', constant_values=(-1)) for act in actions]
+        padded_acts = torch.tensor(np.array(padded_acts), dtype=torch.float32).to(self.device)
+        actions_view = padded_acts.view(1,self.trajectory_length,-1)
+        actions_emb=self.embedding_act(actions_view)
+        action_features=actions_emb.view(1,self.trajectory_length,-1)
+
+        trajectory=trajectory.view(1,self.trajectory_length,-1)
+        trajectory_image_features = self.encode_observation(trajectory)
+        trajectory_image_features=self.obs_encoder_linear(trajectory_image_features)
+        trajectory_image_features = torch.cat([trajectory_image_features, action_features], dim=-1)
+        return self.get_cost_per_trajectory(trajectory_image_features,text_features,length,is_predict_cost)
+    
     
     
     def forward(self, observations, actions, input_ids, attention_mask, lengths):
