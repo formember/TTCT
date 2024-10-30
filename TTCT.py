@@ -7,7 +7,7 @@ import numpy as np
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
 
-class U3T(nn.Module):
+class TTCT(nn.Module):
     def __init__(self,
                  embed_dim: int,
                  act_dim: int,

@@ -4,7 +4,7 @@ from loguru import logger
 from torch import optim
 from utils import gen_mask,KLLoss,split_dataset
 from torch.optim import lr_scheduler
-from U3T import U3T
+from TTCT import TTCT
 from tensorboardX import SummaryWriter
 from transformers import BertTokenizer
 from tqdm import tqdm
@@ -39,7 +39,7 @@ if __name__ == '__main__':
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     trajectory_length = args.trajectory_length
     context_length = args.context_length
-    model=U3T(
+    model=TTCT(
         embed_dim = args.embed_dim,
         trajectory_length = args.trajectory_length,
         context_length = args.context_length,
