@@ -10,9 +10,7 @@ To install the required dependencies, run the following command:
 
 ## Train TTCT
 
-generate your own dataset and put it in `./dataset/data.pkl`.
-
-Then train TTCT, run: `python train.py`
+train TTCT, run: `python train.py`
 
 ## Train Policy
 
