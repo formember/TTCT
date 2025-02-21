@@ -1,6 +1,6 @@
 # TTCT
 
-TTCT: Unified Trajectory-level Text Constraints Translator for Safe RL
+TTCT: Trajectory-level Textual Constraints Translator
 
 ## Installation
 
